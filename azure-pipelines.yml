@@ -1,0 +1,424 @@
+trigger:
+  branches:
+    include:
+      - main
+
+pool:
+  name: Default
+
+variables:
+  buildConfiguration: 'Release'
+  
+  # IIS Configuration
+  iisSiteName: 'DemoApp'
+  iisWebRoot:  'C:\inetpub\DemoApp'
+  
+  # Health Check
+  healthCheckUrl: 'http://localhost/health'
+  enableHealthCheck: true
+  healthCheckTimeout: 60
+
+  # Server Paths
+  packageStore: 'C:\deploy\packages'
+  backupStore:  'C:\deploy\backups'
+  extractRoot:  'C:\deploy\_extract'
+  logStore:     'C:\deploy\logs'
+
+  # Retention Settings
+  retentionDays: 30
+
+steps:
+- checkout: self
+  clean: true
+
+# -----------------------------------------------------------------
+# 1. BUILD & PUBLISH
+# -----------------------------------------------------------------
+- task: UseDotNet@2
+  displayName: 'Install .NET SDK'
+  inputs:
+    packageType: 'sdk'
+    version: '9.x'
+    
+- powershell: |
+    $ErrorActionPreference = "Stop"
+    Write-Host "Building DemoWebApp..."
+    
+    dotnet --version
+    dotnet restore DemoWebApp.csproj
+    dotnet build DemoWebApp.csproj -c "$(buildConfiguration)" --no-restore
+    
+    # Publish
+    dotnet publish DemoWebApp.csproj -c "$(buildConfiguration)" --no-build `
+      -o "$(Build.ArtifactStagingDirectory)\publish" `
+      /p:DebugType=None /p:DebugSymbols=false
+      
+    Write-Host "Build completed successfully"
+  displayName: "Build and Publish DemoWebApp"
+
+# -----------------------------------------------------------------
+# 2. ZIP ARTIFACT
+# -----------------------------------------------------------------
+- task: ArchiveFiles@2
+  displayName: "Zip Publish Output"
+  inputs:
+    rootFolderOrFile: '$(Build.ArtifactStagingDirectory)\publish'
+    includeRootFolder: false
+    archiveType: 'zip'
+    archiveFile: '$(Build.ArtifactStagingDirectory)\drop\app.zip'
+    replaceExistingArchive: true
+
+# -----------------------------------------------------------------
+# 3. PRE-DEPLOYMENT VALIDATION
+# -----------------------------------------------------------------
+- powershell: |
+    $ErrorActionPreference = "Stop"
+    
+    Write-Host "=========================================="
+    Write-Host "Pre-Deployment Validation"
+    Write-Host "=========================================="
+    
+    $zipPath = "$(Build.ArtifactStagingDirectory)\drop\app.zip"
+    
+    # Verify zip exists
+    if (!(Test-Path $zipPath)) {
+        throw "Package not found: $zipPath"
+    }
+    
+    $zipSize = (Get-Item $zipPath).Length
+    if ($zipSize -lt 1KB) {
+        throw "Package too small: ${zipSize} bytes"
+    }
+    Write-Host "✓ Package size: $([math]::Round($zipSize/1MB, 2)) MB"
+    
+    # Validate contents
+    Add-Type -AssemblyName System.IO.Compression.FileSystem
+    $zip = [System.IO.Compression.ZipFile]::OpenRead($zipPath)
+    
+    $entryCount = $zip.Entries.Count
+    if ($entryCount -eq 0) {
+        $zip.Dispose()
+        throw "Package is empty"
+    }
+    
+    Write-Host "✓ Package contains $entryCount files"
+    
+    # Look for DemoWebApp.dll
+    $hasDll = $zip.Entries | Where-Object { $_.Name -eq "DemoWebApp.dll" }
+    if (!$hasDll) {
+        Write-Host "`nPackage contents:"
+        $zip.Entries | Select-Object -First 20 | ForEach-Object { Write-Host "  $($_.FullName)" }
+        $zip.Dispose()
+        throw "DemoWebApp.dll not found in package"
+    }
+    
+    Write-Host "✓ DemoWebApp.dll found"
+    $zip.Dispose()
+    
+    # Check disk space
+    try {
+        $webRoot = "$(iisWebRoot)"
+        $drive = [System.IO.Path]::GetPathRoot($webRoot)
+        $driveLetter = $drive.TrimEnd('\', ':')
+        $driveInfo = Get-PSDrive $driveLetter -ErrorAction Stop
+        $freeSpaceGB = [math]::Round($driveInfo.Free / 1GB, 2)
+        
+        if ($driveInfo.Free -lt 1GB) {
+            throw "Low disk space: ${freeSpaceGB} GB"
+        }
+        Write-Host "✓ Disk space: ${freeSpaceGB} GB available"
+    } catch {
+        Write-Warning "Could not check disk space: $_"
+    }
+    
+    Write-Host "`n✓ All validation checks passed"
+    
+  displayName: "Pre-Deployment Validation"
+
+# -----------------------------------------------------------------
+# 4. DEPLOYMENT
+# -----------------------------------------------------------------
+- powershell: |
+    $ErrorActionPreference = "Stop"
+    $Global:ProgressPreference = 'SilentlyContinue'
+    
+    # Ensure log directory exists
+    $logStore = "$(logStore)"
+    if (!(Test-Path $logStore)) { 
+        New-Item -ItemType Directory -Force $logStore | Out-Null 
+    }
+    
+    $ts = Get-Date -Format "yyyyMMdd-HHmmss"
+    $logFile = Join-Path $logStore "deployment_${ts}_b$(Build.BuildId).log"
+    
+    Start-Transcript -Path $logFile
+    
+    try {
+        Import-Module WebAdministration
+
+        # --- VARIABLES ---
+        $siteName    = "$(iisSiteName)"
+        $webRoot     = "$(iisWebRoot)"
+        $pkgStore    = "$(packageStore)"
+        $bakStore    = "$(backupStore)"
+        $extractRoot = "$(extractRoot)"
+        $enableHealthCheck = [System.Convert]::ToBoolean("$(enableHealthCheck)")
+        $healthUrl   = "$(healthCheckUrl)".Trim()
+        
+        $sha = "$(Build.SourceVersion)".Substring(0, [System.Math]::Min(8, "$(Build.SourceVersion)".Length))
+        $ver = "${ts}_b$(Build.BuildId)_${sha}"
+
+        Write-Host "=========================================="
+        Write-Host "DEPLOYMENT VERSION: $ver"
+        Write-Host "=========================================="
+
+        # --- HELPER FUNCTIONS ---
+        
+        function Wait-ForFileLockRelease {
+            param([string]$Path, [int]$MaxRetries = 10)
+            
+            Write-Host "Waiting for file locks..."
+            for ($i = 0; $i -lt $MaxRetries; $i++) {
+                try {
+                    $testFile = Join-Path $Path "deploy_test.tmp"
+                    [IO.File]::WriteAllText($testFile, "test")
+                    Remove-Item $testFile -Force
+                    Write-Host "✓ File locks released"
+                    return
+                } catch {
+                    if ($i -eq $MaxRetries - 1) { 
+                        Write-Warning "Proceeding despite file lock warning"
+                        return
+                    }
+                    $waitTime = [math]::Min([math]::Pow(2, $i), 10)
+                    Write-Host "Attempt $($i + 1)/$MaxRetries - Waiting ${waitTime}s..."
+                    Start-Sleep -Seconds $waitTime
+                }
+            }
+        }
+        
+        function Test-WebsiteHealth {
+            param([string]$Url, [int]$TimeoutSec = 30, [int]$MaxRetries = 5)
+            
+            if ([string]::IsNullOrWhiteSpace($Url)) {
+                Write-Host "⚠ Health check disabled"
+                return
+            }
+            
+            Write-Host "Running health check: $Url"
+            
+            for ($i = 0; $i -lt $MaxRetries; $i++) {
+                try {
+                    $response = Invoke-WebRequest -Uri $Url -UseBasicParsing -TimeoutSec $TimeoutSec -ErrorAction Stop
+                    
+                    if ($response.StatusCode -eq 200) {
+                        Write-Host "✓ Health check passed (HTTP $($response.StatusCode))"
+                        return
+                    }
+                } catch {
+                    Write-Warning "Attempt $($i + 1)/$MaxRetries failed: $($_.Exception.Message)"
+                    if ($i -lt $MaxRetries - 1) { Start-Sleep -Seconds 5 }
+                }
+            }
+            
+            throw "Health check failed after $MaxRetries attempts"
+        }
+
+        # --- SETUP ---
+        Write-Host "`n[SETUP]"
+        $pkgStore, $bakStore, $extractRoot, $webRoot, $logStore | ForEach-Object { 
+            if (!(Test-Path $_)) { 
+                New-Item -ItemType Directory -Force $_ | Out-Null 
+            } 
+        }
+
+        # Find AppPool
+        $appPool = $null
+        if (Test-Path "IIS:\AppPools\$siteName") { 
+            $appPool = $siteName 
+        } else {
+            $rootApp = Get-WebApplication -Site $siteName | Where-Object { $_.Path -eq "/" } | Select-Object -First 1
+            if ($rootApp) { $appPool = $rootApp.ApplicationPool }
+        }
+        if (!$appPool) { throw "Cannot find AppPool for '$siteName'" }
+        Write-Host "✓ AppPool: $appPool"
+        
+        if (!(Get-Website -Name $siteName)) {
+            throw "IIS site '$siteName' not found"
+        }
+        Write-Host "✓ Site: $siteName"
+
+        # --- PACKAGE PREP ---
+        Write-Host "`n[PREPARATION]"
+        
+        $srcZip  = "$(Build.ArtifactStagingDirectory)\drop\app.zip"
+        $destZip = Join-Path $pkgStore "app_${ver}.zip"
+        Copy-Item $srcZip $destZip -Force
+        
+        $checksum = (Get-FileHash -Path $destZip -Algorithm SHA256).Hash
+        
+        @{
+            version = $ver
+            buildId = "$(Build.BuildId)"
+            commit = "$(Build.SourceVersion)"
+            checksum = $checksum
+            deployedAt = (Get-Date).ToString("o")
+        } | ConvertTo-Json | Out-File (Join-Path $pkgStore "app_${ver}.json") -Encoding utf8
+        
+        Write-Host "✓ Package stored"
+
+        # Extract
+        $tempExtract = Join-Path $extractRoot "app_${ver}"
+        if (Test-Path $tempExtract) { Remove-Item $tempExtract -Recurse -Force }
+        New-Item -ItemType Directory -Force $tempExtract | Out-Null
+        Expand-Archive -Path $destZip -DestinationPath $tempExtract -Force
+        
+        $extractedFiles = (Get-ChildItem $tempExtract -Recurse -File).Count
+        Write-Host "✓ Extracted $extractedFiles files"
+
+        # Backup
+        Write-Host "`n[BACKUP]"
+        $backupZip = Join-Path $bakStore "backup_${ver}.zip"
+        $backupSuccess = $false
+        
+        $currentFiles = Get-ChildItem $webRoot -ErrorAction SilentlyContinue
+        if ($currentFiles -and $currentFiles.Count -gt 0) {
+            try {
+                Compress-Archive -Path (Join-Path $webRoot "*") -DestinationPath $backupZip -Force
+                $backupSuccess = $true
+                Write-Host "✓ Backup created: $([math]::Round((Get-Item $backupZip).Length/1MB, 2)) MB"
+            } catch {
+                Write-Warning "Backup failed: $_"
+            }
+        } else {
+            Write-Host "⚠ No files to backup"
+        }
+
+        # --- DEPLOYMENT ---
+        $deploymentSuccess = $false
+        
+        try {
+            Write-Host "`n[DEPLOY]"
+            
+            Write-Host "Stopping IIS..."
+            if ((Get-WebAppPoolState -Name $appPool).Value -ne "Stopped") {
+                Stop-WebAppPool -Name $appPool
+            }
+            if ((Get-WebsiteState -Name $siteName).Value -ne "Stopped") {
+                Stop-Website -Name $siteName
+            }
+            Write-Host "✓ IIS stopped"
+            
+            Wait-ForFileLockRelease -Path $webRoot
+            
+            Write-Host "Copying files..."
+            
+            # Robocopy with proper exit code handling
+            robocopy $tempExtract $webRoot /MIR /R:3 /W:5 /NFL /NDL /NP /MT:8 2>&1 | Out-Null
+            
+            $robocopyExit = $LASTEXITCODE
+            if ($robocopyExit -lt 8) {
+                $global:LASTEXITCODE = 0
+            }
+            
+            if ($robocopyExit -ge 8) { 
+                throw "Robocopy failed (exit: $robocopyExit)" 
+            }
+            
+            Write-Host "✓ Files deployed (exit: $robocopyExit)"
+            
+            @{
+                version = $ver
+                deployedAt = (Get-Date).ToString("o")
+            } | ConvertTo-Json | Out-File (Join-Path $webRoot "deployment.json") -Encoding utf8
+            
+            $deploymentSuccess = $true
+
+        } catch {
+            Write-Error "DEPLOYMENT FAILED: $_"
+            
+            if ($backupSuccess -and (Test-Path $backupZip)) {
+                Write-Host "!!! ROLLING BACK !!!"
+                Get-ChildItem $webRoot -ErrorAction SilentlyContinue | Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
+                Expand-Archive -Path $backupZip -DestinationPath $webRoot -Force
+                Write-Host "✓ Rollback completed"
+            }
+            throw
+            
+        } finally {
+            Write-Host "`n[RECOVERY]"
+            
+            try {
+                if ((Get-WebAppPoolState -Name $appPool).Value -eq "Stopped") {
+                    Start-WebAppPool -Name $appPool
+                }
+                Start-Sleep -Seconds 2
+                if ((Get-WebsiteState -Name $siteName).Value -eq "Stopped") {
+                    Start-Website -Name $siteName
+                }
+                Write-Host "✓ IIS started"
+            } catch {
+                Write-Error "Failed to start IIS: $_"
+            }
+        }
+
+        # --- VERIFICATION ---
+        if ($deploymentSuccess -and $enableHealthCheck) {
+            Write-Host "`n[VERIFY]"
+            Start-Sleep -Seconds 8
+            
+            try {
+                Test-WebsiteHealth -Url $healthUrl -TimeoutSec $(healthCheckTimeout)
+                Write-Host "✓ Health check passed"
+            } catch {
+                Write-Warning "Health check failed: $_"
+            }
+        }
+
+        # --- CLEANUP ---
+        Write-Host "`n[CLEANUP]"
+        $cutoff = (Get-Date).AddDays(-$(retentionDays))
+        
+        $cleaned = 0
+        Get-ChildItem $bakStore -File -ErrorAction SilentlyContinue | 
+            Where-Object { $_.LastWriteTime -lt $cutoff } | 
+            ForEach-Object { Remove-Item $_.FullName -Force; $cleaned++ }
+            
+        Get-ChildItem $pkgStore -File -ErrorAction SilentlyContinue | 
+            Where-Object { $_.LastWriteTime -lt $cutoff } | 
+            ForEach-Object { Remove-Item $_.FullName -Force; $cleaned++ }
+            
+        if ($cleaned -gt 0) {
+            Write-Host "✓ Cleaned $cleaned old file(s)"
+        }
+        
+        Write-Host "`n=========================================="
+        Write-Host "DEPLOYMENT SUCCESSFUL"
+        Write-Host "Version: $ver"
+        Write-Host "=========================================="
+        
+    } catch {
+        Write-Host "`n=========================================="
+        Write-Host "DEPLOYMENT FAILED"
+        Write-Host "=========================================="
+        Write-Error $_.Exception.Message
+        throw
+    } finally {
+        try { 
+            Stop-Transcript -ErrorAction SilentlyContinue 
+        } catch { }
+    }
+
+  displayName: "Deploy to IIS"
+
+# -----------------------------------------------------------------
+# 5. PUBLISH LOGS
+# -----------------------------------------------------------------
+- task: PublishBuildArtifacts@1
+  displayName: "Publish Deployment Logs"
+  condition: always()
+  continueOnError: true
+  inputs:
+    PathtoPublish: '$(logStore)'
+    ArtifactName: 'deployment-logs'
+    publishLocation: 'Container'
